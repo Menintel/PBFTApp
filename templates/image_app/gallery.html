@@ -1,0 +1,127 @@
+{% extends 'image_app/base.html' %}
+
+{% block content %}
+    <div class="mb-8">
+        <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+            <h1 class="text-3xl font-bold text-gray-800 mb-2">
+                {% if search_query %}
+                    Search Results for "{{ search_query }}"
+                {% else %}
+                    Tamkine Blockchain Image Gallery
+                {% endif %}
+            </h1>
+            <p class="text-gray-600 mb-4">
+                {% if search_query %}
+                    Showing results for your search. {% else %}
+                    A collection of beautiful, free-to-use images from Unsplash, secured with PBFT blockchain.
+                {% endif %}
+            </p>
+            
+            <!-- Search Form -->
+            <form method="get" action="{% url 'image_app:unsplash-gallery' %}" class="mb-0">
+                <div class="flex flex-col md:flex-row gap-4">
+                    <div class="flex-1">
+                        <input type="text" 
+                               name="q" 
+                               value="{{ search_query }}" 
+                               placeholder="Search for images..." 
+                               class="w-full rounded-lg border-2 border-gray-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                               aria-label="Search images">
+                    </div>
+                    <button type="submit" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-8 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors whitespace-nowrap">
+                        Search Images
+                    </button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Blockchain Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div class="bg-white p-4 rounded-lg shadow">
+                <div class="text-gray-500 text-sm font-medium">Node ID</div>
+                <div class="text-lg font-semibold text-gray-800 truncate">{{ blockchain.node_id }}</div>
+                <div class="text-sm text-gray-500 mt-1">
+                    <span class="inline-flex items-center">
+                        <span class="w-2 h-2 rounded-full {{ blockchain.is_primary|yesno:'bg-green-500, bg-gray-400' }} mr-1"></span>
+                        {{ blockchain.is_primary|yesno:"Primary Node, Replica Node" }}
+                    </span>
+                </div>
+            </div>
+            <div class="bg-white p-4 rounded-lg shadow">
+                <div class="text-gray-500 text-sm font-medium">Current View</div>
+                <div class="text-2xl font-bold text-blue-600">#{{ blockchain.current_view }}</div>
+                <div class="text-sm text-gray-500">Consensus Round</div>
+            </div>
+            <div class="bg-white p-4 rounded-lg shadow">
+                <div class="text-gray-500 text-sm font-medium">Blocks</div>
+                <div class="text-2xl font-bold text-gray-800">{{ blockchain.total_blocks }}</div>
+                <div class="text-sm text-gray-500">Total Blocks</div>
+            </div>
+            <div class="bg-white p-4 rounded-lg shadow">
+                <div class="text-gray-500 text-sm font-medium">Network</div>
+                <div class="text-xl font-bold text-gray-800">{{ blockchain.active_nodes }} / {{ blockchain.active_nodes|add:"1" }}</div>
+                <div class="text-sm text-gray-500">Active Nodes</div>
+            </div>
+        </div>
+    </div>
+    
+    {% if images %}
+        {% if search_query and not has_results %}
+            <div class="text-center py-12 bg-yellow-50 rounded-lg">
+                <p class="text-yellow-700">No results found for "{{ search_query }}". Here are some random images instead.</p>
+            </div>
+        {% endif %}
+        
+        <div class="gallery">
+            {% for image in images %}
+                <div class="gallery-item">
+                    <a href="{{ image.url }}" target="_blank" rel="noopener noreferrer" class="block">
+                        <img src="{{ image.thumb }}" 
+                             alt="{{ image.alt }}" 
+                             class="w-full h-auto rounded-t-lg shadow-md"
+                             loading="lazy">
+                    </a>
+                    <div class="bg-white p-3 rounded-b-lg shadow-md">
+                        <p class="text-sm text-gray-700">
+                            Photo by <a href="{{ image.photographer_url }}" 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                class="text-blue-600 hover:underline">{{ image.photographer }}</a>
+                        </p>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+        
+        <div class="mt-8 text-center space-x-4">
+            {% if search_query %}
+                <a href="{% url 'image_app:unsplash-gallery' %}" 
+                   class="inline-flex items-center px-6 py-3 border border-gray-300 text-base font-medium rounded-lg shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M9.707 16.707a1 1 0 01-1.414 0l-6-6a1 1 0 010-1.414l6-6a1 1 0 011.414 1.414L5.414 9H17a1 1 0 110 2H5.414l4.293 4.293a1 1 0 010 1.414z" clip-rule="evenodd" />
+                    </svg>
+                    Back to Random Images
+                </a>
+            {% endif %}
+            <a href="{% url 'image_app:unsplash-gallery' %}{% if search_query %}?q={{ search_query|urlencode }}{% endif %}" 
+               class="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-lg shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">
+                {% if search_query %}
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+                    </svg>
+                    Load More Results
+                {% else %}
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+                    </svg>
+                    Load More Images
+                {% endif %}
+            </a>
+        </div>
+    {% else %}
+        <div class="text-center py-12">
+            <p class="text-gray-600">No images found. Please try again later.</p>
+        </div>
+    {% endif %}
+{% endblock %}

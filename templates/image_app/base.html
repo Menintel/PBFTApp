@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Tamkine Test website For Extenal API Blockchain Integration{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        .gallery {
+            column-count: 4;
+            column-gap: 1rem;
+        }
+        @media (max-width: 1024px) {
+            .gallery { column-count: 3; }
+        }
+        @media (max-width: 768px) {
+            .gallery { column-count: 2; }
+        }
+        @media (max-width: 640px) {
+            .gallery { column-count: 1; }
+        }
+        .gallery-item {
+            break-inside: avoid;
+            margin-bottom: 1rem;
+        }
+        .gallery-item img {
+            width: 100%;
+            height: auto;
+            border-radius: 0.5rem;
+            transition: transform 0.3s ease;
+        }
+        .gallery-item img:hover {
+            transform: scale(1.02);
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <header class="bg-white shadow-sm">
+        <div class="max-w-7xl mx-auto px-4 py-4 sm:px-6 lg:px-8">
+            <h1 class="text-2xl font-bold text-gray-900">Tamkine Test website For Extenal API Blockchain Integration</h1>
+        </div>
+    </header>
+    
+    <main class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+        {% block content %}{% endblock %}
+    </main>
+    
+    <footer class="bg-white mt-8 py-4 border-t">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-gray-500 text-sm">
+            <p>Powered by <a href="https://unsplash.com/" target="_blank" class="text-blue-600 hover:text-blue-800">Unsplash API</a></p>
+        </div>
+    </footer>
+</body>
+</html>
