@@ -26,20 +26,47 @@ class PBFTValidator:
         from django.conf import settings
         
         # Use Django settings if parameters not provided
-        self.node_id = node_id or settings.NODE_ID
+        self.node_id = node_id or getattr(settings, 'NODE_ID', 'node_1')
         self.node_address = node_address or '127.0.0.1'
-        self.port = port or int(settings.NODE_PORT)
+        self.port = int(port) if port is not None else int(getattr(settings, 'NODE_PORT', 8000))
         self.node_url = f"http://{self.node_address}:{self.port}"
         
-        # Initialize node information from settings
+        # Initialize node information
         self.nodes = {}
-        for node_id, node_url in settings.PBFT_NODES.items():
-            if node_id != self.node_id:  # Exclude self
-                self.nodes[node_id] = {
-                    'url': node_url,
-                    'active': True,
-                    'last_seen': time.time()
-                }
+        
+        # Try to get nodes from settings first
+        if hasattr(settings, 'PBFT_NODES'):
+            for nid, node_url in settings.PBFT_NODES.items():
+                if nid != self.node_id:  # Exclude self
+                    self.nodes[nid] = {
+                        'url': node_url,
+                        'active': True,
+                        'last_seen': time.time()
+                    }
+        # Fall back to node_list if provided
+        elif node_list:
+            for node in node_list:
+                if node['id'] != self.node_id:  # Exclude self
+                    self.nodes[node['id']] = {
+                        'url': f"http://{node['address']}:{node['port']}",
+                        'active': True,
+                        'last_seen': time.time()
+                    }
+        else:
+            # Default configuration if nothing else is available
+            default_nodes = {
+                'node_1': 'http://127.0.0.1:8000',
+                'node_2': 'http://127.0.0.1:8001',
+                'node_3': 'http://127.0.0.1:8002',
+                'node_4': 'http://127.0.0.1:8003'
+            }
+            for nid, node_url in default_nodes.items():
+                if nid != self.node_id:
+                    self.nodes[nid] = {
+                        'url': node_url,
+                        'active': True,
+                        'last_seen': time.time()
+                    }
         
         # Initialize consensus
         total_nodes = len(settings.PBFT_NODES)
@@ -53,52 +80,122 @@ class PBFTValidator:
     
     def broadcast(self, endpoint: str, message: dict, exclude: List[str] = None) -> List[dict]:
         """
-        Broadcast a message to all nodes in the network.
+        Broadcast a message to all nodes in the network with enhanced error handling and logging.
         
         Args:
-            endpoint: API endpoint to call on each node
-            message: Message to send
+            endpoint: API endpoint to call on each node (e.g., 'api/consensus/prepare/')
+            message: Message to send (will be converted to JSON)
             exclude: List of node IDs to exclude from broadcast
             
         Returns:
-            List of response dictionaries from each node
+            List of tuples containing (node_id, success, response_data) for each node
         """
         from django.conf import settings
+        import json
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
         exclude = exclude or []
         results = []
         
-        def send_to_node(node_id, node_info):
-            if node_id in exclude or not node_info.get('active', True):
-                return None
+        def send_to_node(node_id: str, node_info: dict) -> tuple:
+            """Helper function to send a message to a single node."""
+            if node_id in exclude:
+                print(f"[Broadcast] Skipping {node_id} (excluded)")
+                return (node_id, False, {'error': 'Node excluded'})
                 
-            url = f"{node_info['url'].rstrip('/')}/{endpoint.lstrip('/')}"
+            if not node_info.get('active', True):
+                print(f"[Broadcast] Skipping {node_id} (inactive)")
+                return (node_id, False, {'error': 'Node inactive'})
+            
+            # Ensure URL is properly formatted
+            base_url = node_info['url'].rstrip('/')
+            endpoint_clean = endpoint.lstrip('/')
+            url = f"{base_url}/{endpoint_clean}"
+            
+            print(f"[Broadcast] Sending to {node_id} at {url}")
+            
             try:
+                # Prepare headers
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-Node-ID': self.node_id,
+                    'X-Message-Type': endpoint_clean.split('/')[-1]  # e.g., 'pre-prepare', 'prepare', 'commit'
+                }
+                
+                # Log the message being sent (truncate if too long)
+                msg_str = json.dumps(message, indent=2)
+                print(f"[Broadcast] Sending to {node_id} at {url}: {msg_str[:200]}...")
+                
+                # Send the request with increased timeout
                 response = requests.post(
                     url,
                     json=message,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=5
+                    headers=headers,
+                    timeout=10  # Increased timeout to 10 seconds
                 )
+                
+                # Update node status
                 node_info['last_seen'] = time.time()
                 node_info['active'] = True
-                return (node_id, True, response.json())
-            except Exception as e:
-                print(f"[Validator] Error broadcasting to {node_id} at {url}: {str(e)}")
+                
+                # Try to parse JSON response
+                try:
+                    response_data = response.json()
+                    print(f"[Broadcast] Response from {node_id} ({response.status_code}): {json.dumps(response_data, indent=2)[:200]}...")
+                    return (node_id, True, response_data)
+                except ValueError as e:
+                    error_msg = f"Invalid JSON response from {node_id}: {response.text[:200]}"
+                    print(f"[Broadcast] {error_msg}")
+                    return (node_id, False, {'error': error_msg})
+                
+            except requests.exceptions.Timeout:
+                error_msg = f"Request to {node_id} timed out after 10 seconds"
+                print(f"[Broadcast] {error_msg}")
                 node_info['active'] = False
-                return (node_id, False, {'error': str(e)})
+                return (node_id, False, {'error': error_msg})
+                
+            except requests.exceptions.ConnectionError as e:
+                error_msg = f"Connection error to {node_id} at {url}: {str(e)}"
+                print(f"[Broadcast] {error_msg}")
+                node_info['active'] = False
+                return (node_id, False, {'error': error_msg})
+                
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Request error to {node_id} at {url}: {str(e)}"
+                print(f"[Broadcast] {error_msg}")
+                node_info['active'] = False
+                return (node_id, False, {'error': error_msg})
+                
+            except Exception as e:
+                error_msg = f"Unexpected error sending to {node_id}: {str(e)}"
+                print(f"[Broadcast] {error_msg}")
+                node_info['active'] = False
+                return (node_id, False, {'error': error_msg})
         
-        # Use thread pool for concurrent requests
+        # Process nodes in parallel with a thread pool
         with ThreadPoolExecutor(max_workers=len(self.nodes)) as executor:
-            futures = [
-                executor.submit(send_to_node, node_id, node_info)
+            # Create a future for each node
+            future_to_node = {
+                executor.submit(send_to_node, node_id, node_info): node_id
                 for node_id, node_info in self.nodes.items()
-            ]
-        # Wait for all requests to complete
-        for future in futures:
-            results.append(future.result())
+            }
             
+            # Process results as they complete
+            for future in as_completed(future_to_node):
+                node_id = future_to_node[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    print(f"[Broadcast] Error processing response from {node_id}: {str(e)}")
+                    results.append((node_id, False, {'error': str(e)}))
+        
+        # Log summary of broadcast results
+        success_count = sum(1 for r in results if r and r[1] is True)
+        total_nodes = len(self.nodes)
+        print(f"[Broadcast] Completed: {success_count}/{total_nodes} nodes responded successfully")
+        
         return results
     
     def handle_transaction(self, transaction_data: dict) -> dict:

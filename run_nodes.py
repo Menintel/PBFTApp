@@ -41,6 +41,16 @@ def setup_node(node_config):
     env['NODE_ADDRESS'] = '127.0.0.1'
     env['NODE_PORT'] = str(node_config['port'])
     env['DATABASE_URL'] = f'sqlite:///{BASE_DIR}/{node_config["db"]}'
+    
+    # Set Django settings module
+    env['DJANGO_SETTINGS_MODULE'] = 'Pbftapp.settings'
+    
+    # Set the port for the node
+    env['PORT'] = str(node_config['port'])
+    
+    # Set the allowed hosts
+    env['ALLOWED_HOSTS'] = '127.0.0.1,localhost'
+    
     return env
 
 def run_node(node_config):
@@ -48,6 +58,33 @@ def run_node(node_config):
     print(f"Starting {node_config['id']} on port {node_config['port']}...")
     
     # Set up environment
+    env = setup_node(node_config)
+    
+    # Build the command to run the node
+    cmd = [
+        'python', 'manage.py', 'runserver',
+        f'127.0.0.1:{node_config["port"]}',
+        '--noreload',
+        '--nothreading',
+        f'>> {node_config["log"]} 2>&1',
+    ]
+    
+    try:
+        # Start the process
+        process = subprocess.Popen(
+            ' '.join(cmd),
+            env=env,
+            shell=True,
+            cwd=str(BASE_DIR)
+        )
+        
+        # Store the process for later cleanup
+        node_config['process'] = process
+        return process
+        
+    except Exception as e:
+        print(f"Error starting {node_config['id']}: {e}")
+        return None
     env = setup_node(node_config)
     
     # Create log file if it doesn't exist
