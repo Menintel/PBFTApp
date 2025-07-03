@@ -1,15 +1,30 @@
 import os
 import json
 import logging
+import time
 from django.views import View
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.conf import settings
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.http import require_GET
 from pbft.validator import PBFTValidator
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class HealthCheckView(View):
+    """Simple health check endpoint for node monitoring"""
+    @method_decorator(require_GET)
+    def get(self, request):
+        return JsonResponse({
+            'status': 'healthy',
+            'node_id': getattr(settings, 'NODE_ID', 'unknown'),
+            'timestamp': time.time(),
+            'version': '1.0'
+        })
 
 class ConsensusAPIView(View):
     _validator_instance = None
@@ -74,7 +89,20 @@ class PrePrepareView(ConsensusAPIView):
             try:
                 result = self.validator.handle_pre_prepare(data)
                 logger.info(f"[PrePrepareView] Successfully processed pre-prepare: {result}")
-                return JsonResponse(result)
+                
+                # Return a complete response with all required fields
+                response_data = {
+                    'status': 'success',
+                    'sequence': data.get('sequence'),
+                    'view': data.get('view'),
+                    'digest': data.get('digest'),
+                    'node_id': self.validator.node_id,
+                    'timestamp': time.time(),
+                    'message': 'Pre-prepare message processed',
+                    'result': result
+                }
+                logger.debug(f"[PrePrepareView] Sending response: {response_data}")
+                return JsonResponse(response_data)
             except Exception as e:
                 logger.exception(f"[PrePrepareView] Error processing pre-prepare: {str(e)}")
                 return JsonResponse({'error': f'Error processing pre-prepare: {str(e)}'}, status=500)
@@ -102,7 +130,20 @@ class PrepareView(ConsensusAPIView):
             try:
                 result = self.validator.handle_prepare(data)
                 logger.info(f"[PrepareView] Successfully processed prepare: {result}")
-                return JsonResponse(result)
+                
+                # Return a complete response with all required fields
+                response_data = {
+                    'status': 'success',
+                    'sequence': data.get('sequence'),
+                    'view': data.get('view'),
+                    'digest': data.get('digest'),
+                    'node_id': self.validator.node_id,
+                    'timestamp': time.time(),
+                    'message': 'Prepare message processed',
+                    'result': result
+                }
+                logger.debug(f"[PrepareView] Sending response: {response_data}")
+                return JsonResponse(response_data)
             except Exception as e:
                 logger.exception(f"[PrepareView] Error processing prepare: {str(e)}")
                 return JsonResponse({'error': f'Error processing prepare: {str(e)}'}, status=500)
@@ -130,7 +171,20 @@ class CommitView(ConsensusAPIView):
             try:
                 result = self.validator.handle_commit(data)
                 logger.info(f"[CommitView] Successfully processed commit: {result}")
-                return JsonResponse(result)
+                
+                # Return a complete response with all required fields
+                response_data = {
+                    'status': 'success',
+                    'sequence': data.get('sequence'),
+                    'view': data.get('view'),
+                    'digest': data.get('digest'),
+                    'node_id': self.validator.node_id,
+                    'timestamp': time.time(),
+                    'message': 'Commit message processed',
+                    'result': result
+                }
+                logger.debug(f"[CommitView] Sending response: {response_data}")
+                return JsonResponse(response_data)
             except Exception as e:
                 logger.exception(f"[CommitView] Error processing commit: {str(e)}")
                 return JsonResponse({'error': f'Error processing commit: {str(e)}'}, status=500)
@@ -138,3 +192,51 @@ class CommitView(ConsensusAPIView):
         except Exception as e:
             logger.exception(f"[CommitView] Unexpected error: {str(e)}")
             return JsonResponse({'error': f'Internal server error: {str(e)}'}, status=500)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class TransactionView(ConsensusAPIView):
+    """
+    View to handle incoming transactions from clients or other nodes.
+    """
+    def post(self, request):
+        try:
+            # Log incoming request
+            logger.info(f"[TransactionView] Received transaction from {request.META.get('REMOTE_ADDR')}")
+            
+            # Parse request body
+            try:
+                data = json.loads(request.body)
+                logger.debug(f"[TransactionView] Request data: {json.dumps(data, indent=2)[:500]}...")
+            except json.JSONDecodeError:
+                logger.error("[TransactionView] Invalid JSON in request body")
+                return JsonResponse({'error': 'Invalid JSON'}, status=400)
+            
+            # Process the transaction
+            try:
+                result = self.validator.handle_transaction(data)
+                logger.info(f"[TransactionView] Successfully processed transaction: {result}")
+                
+                # Return a complete response
+                response_data = {
+                    'status': 'success',
+                    'node_id': self.validator.node_id,
+                    'timestamp': time.time(),
+                    'message': 'Transaction received and being processed',
+                    'result': result
+                }
+                logger.debug(f"[TransactionView] Sending response: {response_data}")
+                return JsonResponse(response_data)
+                
+            except Exception as e:
+                logger.exception(f"[TransactionView] Error processing transaction: {str(e)}")
+                return JsonResponse(
+                    {'error': f'Error processing transaction: {str(e)}'}, 
+                    status=500
+                )
+                
+        except Exception as e:
+            logger.exception(f"[TransactionView] Unexpected error: {str(e)}")
+            return JsonResponse(
+                {'error': f'Internal server error: {str(e)}'}, 
+                status=500
+            )

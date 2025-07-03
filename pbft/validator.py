@@ -4,7 +4,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 from django.conf import settings
 from image_app.models import Block, BlockchainState
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .consensus import PBFTConsensus, PBFTState
 
 class PBFTValidator:
@@ -69,16 +69,29 @@ class PBFTValidator:
                     }
         
         # Initialize consensus
-        total_nodes = len(settings.PBFT_NODES)
+        total_nodes = len(self.nodes) + 1  # Include self in total nodes
         self.consensus = PBFTConsensus(self.node_id, total_nodes)
         self.state = PBFTState.REPLY
         self.pending_transactions = []
         self.executor = ThreadPoolExecutor(max_workers=10)
         
+        # State for collecting messages
+        self.pre_prepare_log: Dict[Tuple[int, int], Dict] = {}  # (view, sequence) -> message
+        self.prepare_log: Dict[Tuple[int, int], Dict[str, Dict]] = {}  # (view, sequence) -> {node_id -> message}
+        self.commit_log: Dict[Tuple[int, int], Dict[str, Dict]] = {}  # (view, sequence) -> {node_id -> message}
+        
+        # Node health tracking
+        self.node_health = {node_id: {'last_seen': 0, 'failures': 0} for node_id in self.nodes}
+        self.health_check_interval = 5  # seconds between health checks
+        self.last_health_check = 0
+        self.max_failures = 3  # Number of failures before marking node as inactive
+        self.view_change_timeout = 10  # seconds to wait before initiating view change
+        self.last_primary_activity = time.time()
+
         print(f"[Validator] Initialized node {self.node_id} at {self.node_url}")
         print(f"[Validator] Known nodes: {list(self.nodes.keys())}")
     
-    def broadcast(self, endpoint: str, message: dict, exclude: List[str] = None) -> List[dict]:
+    def broadcast(self, endpoint: str, message: dict, exclude: List[str] = None) -> List[Tuple[str, bool, dict]]:
         """
         Broadcast a message to all nodes in the network with enhanced error handling and logging.
         
@@ -90,10 +103,6 @@ class PBFTValidator:
         Returns:
             List of tuples containing (node_id, success, response_data) for each node
         """
-        from django.conf import settings
-        import json
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         exclude = exclude or []
         results = []
         
@@ -198,6 +207,70 @@ class PBFTValidator:
         
         return results
     
+    def check_node_health(self, node_id: str) -> bool:
+        """Check if a node is healthy by sending a health check request."""
+        if node_id not in self.nodes:
+            return False
+            
+        try:
+            response = requests.get(
+                f"{self.nodes[node_id]['url']}/api/health/",
+                timeout=3
+            )
+            if response.status_code == 200:
+                self.node_health[node_id] = {
+                    'last_seen': time.time(),
+                    'failures': 0
+                }
+                self.nodes[node_id]['active'] = True
+                return True
+        except Exception as e:
+            print(f"[Health] Error checking node {node_id}: {str(e)}")
+            
+        # Update failure count
+        if node_id not in self.node_health:
+            self.node_health[node_id] = {'failures': 0, 'last_seen': 0}
+            
+        self.node_health[node_id]['failures'] += 1
+        
+        # Mark as inactive if too many failures
+        if self.node_health[node_id]['failures'] >= self.max_failures:
+            self.nodes[node_id]['active'] = False
+            print(f"[Health] Node {node_id} marked as inactive")
+            
+        return False
+        
+    def check_primary_health(self) -> bool:
+        """Check if the current primary node is healthy."""
+        primary_id = self.consensus.get_primary(self.consensus.view)
+        if primary_id == self.node_id:
+            return True
+            
+        return self.check_node_health(primary_id)
+        
+    def start_view_change(self):
+        """Initiate a view change to elect a new primary."""
+        if self.consensus.is_primary():
+            return {"status": "error", "message": "Current node is already primary"}
+            
+        print(f"[ViewChange] Starting view change from view {self.consensus.view}")
+        self.consensus.view += 1
+        
+        # Check if this node should be the new primary
+        if self.consensus.is_primary():
+            print(f"[ViewChange] This node is now the primary for view {self.consensus.view}")
+            # Process any pending transactions
+            if self.pending_transactions:
+                print(f"[ViewChange] Processing {len(self.pending_transactions)} pending transactions")
+                return self._start_pbft_consensus_flow({
+                    'index': Block.objects.count() + 1,
+                    'previous_hash': Block.objects.order_by('-index').first().hash if Block.objects.exists() else '0' * 64,
+                    'data': {'transactions': self.pending_transactions},
+                    'timestamp': int(time.time())
+                })
+        
+        return {"status": "success", "message": f"View changed to {self.consensus.view}"}
+        
     def handle_transaction(self, transaction_data: dict) -> dict:
         """
         Handle a new transaction from a client.
@@ -222,251 +295,561 @@ class PBFTValidator:
         self.pending_transactions.append(transaction_data)
         print(f"[Validator] Added to pending transactions. Total pending: {len(self.pending_transactions)}")
         
+        # Check if we need to perform health checks
+        current_time = time.time()
+        if current_time - self.last_health_check > self.health_check_interval:
+            self.last_health_check = current_time
+            # Check primary health
+            if not self.check_primary_health() and not self.consensus.is_primary():
+                print("[Health] Primary node is not responding, initiating view change")
+                return self.start_view_change()
+        
         # If this is the primary node, start the PBFT process
         if self.consensus.is_primary():
-            print("[Validator] This is the primary node. Starting PBFT consensus...")
-            
-            if not self.pending_transactions:
-                return {"status": "success", "message": "No transactions to process"}
-            
-            # Create a block proposal
-            last_block = Block.objects.order_by('-index').first()
-            block_index = last_block.index + 1 if last_block else 1
-            
-            # Create block data (without saving yet)
-            block_data = {
-                'index': block_index,
-                'previous_hash': last_block.hash if last_block else '0' * 64,
-                'data': {'transactions': self.pending_transactions},
-                'timestamp': int(time.time())
-            }
-            
-            # Start PBFT consensus
-            print(f"[PBFT] Starting consensus for block {block_index}")
-            
-            # PHASE 1: Pre-Prepare
-            pre_prepare_msg = self.consensus.pre_prepare(block_data)
-            if 'error' in pre_prepare_msg:
-                return {"status": "error", "message": f"Pre-prepare failed: {pre_prepare_msg['error']}"}
-            
-            # Broadcast pre-prepare message to all replicas
-            pre_prepare_responses = self.broadcast(
-                '/api/consensus/pre-prepare/',
-                pre_prepare_msg
-            )
-            
-            # Wait for 2f + 1 prepare messages (including self)
-            prepare_messages = []
-            for result in pre_prepare_responses:
-                if result is not None and len(result) == 3 and result[1] and isinstance(result[2], dict) and 'sequence' in result[2]:
-                    prepare_messages.append(result[2])
-                elif result is not None:
-                    print(f"[Validator] Invalid response format from node: {result}")
-            
-            # PHASE 2: Prepare
-            if len(prepare_messages) >= 2 * self.consensus.faulty_nodes:
-                # Collect prepare messages from other nodes
-                prepare_msgs = []
-                for msg in prepare_messages:
-                    prepare_response = self.consensus.prepare(msg)
-                    if 'error' not in prepare_response:
-                        prepare_msgs.append(prepare_response)
-                
-                # PHASE 3: Commit
-                if len(prepare_msgs) >= 2 * self.consensus.faulty_nodes:
-                    commit_msgs = []
-                    commit_msg = self.consensus.commit(prepare_msgs)
-                    if commit_msg:
-                        commit_msgs.append(commit_msg)
-                    
-                    # Broadcast commit message
-                    commit_responses = self.broadcast(
-                        '/api/consensus/commit/',
-                        commit_msg
-                    )
-                    
-                    # Collect commit messages from other nodes
-                    for result in commit_responses:
-                        if result is not None and len(result) == 3 and result[1] and isinstance(result[2], dict) and 'sequence' in result[2]:
-                            commit_msgs.append(result[2])
-                        elif result is not None:
-                            print(f"[Validator] Invalid commit response format: {result}")
-                    
-                    # PHASE 4: Execute (Create block if we have 2f + 1 commits)
-                    if len(commit_msgs) >= 2 * self.consensus.faulty_nodes + 1:
-                        try:
-                            # Get or create blockchain state
-                            blockchain_state, _ = BlockchainState.objects.get_or_create(
-                                id=1,
-                                defaults={
-                                    'last_block_number': 0,
-                                    'total_transactions': 0,
-                                    'active_nodes': len(self.nodes) + 1  # +1 for self
-                                }
-                            )
-                            
-                            # Create the block with all required fields
-                            block = Block.objects.create(
-                                index=block_index,
-                                previous_hash=block_data['previous_hash'],
-                                data=block_data['data'],
-                                timestamp=block_data['timestamp'],
-                                nonce=0,  # Will be set during mining
-                                hash='0' * 64  # Temporary hash, will be set during mining
-                            )
-                            
-                            # Mine the block to set the correct hash
-                            block.mine_block(difficulty=4)
-                            block.save()
-                            
-                            # Update blockchain state
-                            blockchain_state.update_state(
-                                block=block,
-                                transaction_count=len(self.pending_transactions)
-                            )
-                            
-                            print(f"[PBFT] Committed block {block.index} with {len(self.pending_transactions)} transactions")
-                            
-                            # Clear pending transactions
-                            self.pending_transactions = []
-                            
-                            return {
-                                "status": "success", 
-                                "message": "Block created and committed via PBFT consensus",
-                                "block_index": block.index,
-                                "transactions_processed": len(self.pending_transactions)
-                            }
-                            
-                        except Exception as e:
-                            print(f"[PBFT] Error creating block: {str(e)}")
-                            return {"status": "error", "message": f"Block creation failed: {str(e)}"}
-            
-            return {"status": "error", "message": "Failed to reach consensus"}
+            return self._process_as_primary()
         else:
-            # If not primary, forward to primary node
-            primary_id = self.consensus.get_primary(self.consensus.view)
-            if primary_id in self.nodes and self.nodes[primary_id]['active']:
-                primary_url = self.nodes[primary_id]['url']
-                try:
-                    print(f"[Validator] Forwarding transaction to primary node: {primary_url}")
-                    response = requests.post(
-                        f"{primary_url}/api/transaction/",
-                        json=transaction_data,
-                        headers={'Content-Type': 'application/json'},
-                        timeout=5
-                    )
-                    print(f"[Validator] Primary node response: {response.status_code}")
-                    return response.json()
-                except Exception as e:
-                    print(f"[Validator] Error forwarding to primary: {str(e)}")
-                    return {"status": "error", "message": f"Failed to forward to primary: {str(e)}"}
-            else:
-                print(f"[Validator] Primary node {primary_id} not available or inactive")
-                return {"status": "error", "message": "Primary node not available"}
-    
-    def _start_pbft_consensus(self, transaction_data: dict) -> dict:
-        """
-        Start the PBFT consensus process for a transaction.
-        
-        Args:
-            transaction_data: Transaction data to reach consensus on
+            return self._forward_to_primary(transaction_data)
             
-        Returns:
-            Dict containing the result of the consensus process
-        """
-        # Pre-prepare phase
-        pre_prepare = self.consensus.pre_prepare(transaction_data)
-        if 'error' in pre_prepare:
-            return {"status": "error", "message": f"Pre-prepare failed: {pre_prepare['error']}"}
+    def _process_as_primary(self):
+        """Process transactions as the primary node."""
+        print("[Validator] This is the primary node. Starting PBFT consensus...")
         
-        # Broadcast pre-prepare message to all replicas
-        responses = self.broadcast(
-            "consensus/pre-prepare",
-            pre_prepare,
-            exclude=[self.node_id]  # Don't send to self
+        if not self.pending_transactions:
+            return {"status": "success", "message": "No transactions to process"}
+        
+        # Create a block proposal
+        last_block = Block.objects.order_by('-index').first()
+        block_index = last_block.index + 1 if last_block else 1
+        
+        # Create block data (without saving yet)
+        block_data = {
+            'index': block_index,
+            'previous_hash': last_block.hash if last_block else '0' * 64,
+            'data': {'transactions': self.pending_transactions},
+            'timestamp': int(time.time())
+        }
+        
+        # Start PBFT consensus
+        print(f"[PBFT] Starting consensus for block {block_index}")
+        return self._start_pbft_consensus_flow(block_data)
+        
+    def _forward_to_primary(self, transaction_data):
+        """Forward transaction to the primary node with retry logic."""
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            primary_id = self.consensus.get_primary(self.consensus.view)
+            if primary_id not in self.nodes or not self.nodes[primary_id].get('active', True):
+                print(f"[Validator] Primary node {primary_id} not available, checking if view change is needed")
+                if attempt == max_retries - 1:  # Last attempt
+                    return self.start_view_change()
+                time.sleep(retry_delay)
+                continue
+                
+            primary_url = self.nodes[primary_id]['url']
+            try:
+                print(f"[Validator] Forwarding transaction to primary node: {primary_url}")
+                response = requests.post(
+                    f"{primary_url}/api/transaction/",
+                    json=transaction_data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=5
+                )
+                print(f"[Validator] Primary node response: {response.status_code}")
+                return response.json()
+            except Exception as e:
+                print(f"[Validator] Error forwarding to primary: {str(e)}")
+                if attempt == max_retries - 1:  # Last attempt
+                    print("[Validator] Max retries reached, initiating view change")
+                    return self.start_view_change()
+                time.sleep(retry_delay)
+        
+        return {"status": "error", "message": "Failed to forward to primary after multiple attempts"}
+    
+    def _start_pbft_consensus_flow(self, block_data: dict) -> dict:
+        """
+        Starts and manages the full PBFT consensus flow from the primary's perspective.
+        This method replaces the internal, somewhat simplified, logic previously in handle_transaction.
+        """
+        # Get current view and generate digest for the block data
+        view = self.consensus.view
+        sequence = self.consensus.sequence_number  # Will be updated by pre_prepare call
+        digest = self.consensus._hash_message(block_data)
+
+        # PHASE 1: Pre-Prepare
+        pre_prepare_msg = self.consensus.pre_prepare(block_data)  # This updates internal state
+        if 'error' in pre_prepare_msg:
+            return {"status": "error", "message": f"Pre-prepare failed: {pre_prepare_msg['error']}"}
+
+        # The primary node's own pre-prepare message is considered valid and implicitly "prepared" by itself.
+        self.pre_prepare_log[(view, sequence)] = pre_prepare_msg
+        
+        # Primary also implicitly sends itself a prepare message and records it
+        self.prepare_log.setdefault((view, sequence), {})[self.node_id] = {
+            'view': view, 'sequence': sequence, 'digest': digest, 'node_id': self.node_id
+        }
+        
+        # Broadcast pre-prepare message
+        print(f"[PBFT Primary] Broadcasting pre-prepare for (view={view}, sequence={sequence})")
+        responses_from_replicas = self.broadcast(
+            '/api/consensus/pre-prepare/',
+            pre_prepare_msg,
+            exclude=[self.node_id]
+        )
+
+        print("[PBFT Primary] Awaiting prepare messages (simulated wait)...")
+        # Simulate waiting for prepare messages (in a real system, this would be event-driven)
+        time.sleep(1) 
+
+        # PHASE 1: Pre-Prepare (Primary's action)
+        _pre_prepare_msg = self.consensus.pre_prepare(block_data) # Updates consensus state
+        if 'error' in _pre_prepare_msg:
+            return {"status": "error", "message": f"Pre-prepare failed: {_pre_prepare_msg['error']}"}
+
+        # Primary processes its own pre-prepare as if it received it.
+        # This will store it in the pre_prepare_log and prepare_log.
+        self.handle_pre_prepare(_pre_prepare_msg) 
+        
+        # Get the block index from block_data
+        block_index = block_data.get('index')
+        if block_index is None:
+            return {"status": "error", "message": "Block data is missing 'index' field"}
+            
+        # Broadcast pre-prepare message to all replicas (excluding self)
+        print(f"[PBFT Primary] Broadcasting pre-prepare for sequence {block_index}")
+        # The actual `pre_prepare_responses` here are just acknowledgements of receipt,
+        # not the prepare messages themselves. Replicas will then send prepare messages
+        # back to the primary's /api/consensus/prepare endpoint.
+        self.broadcast(
+            '/api/consensus/pre-prepare/',
+            _pre_prepare_msg,
+            exclude=[self.node_id] 
         )
         
-        # Check if we have enough responses (2f + 1)
-        successful_responses = [r for r in responses if r[0]]
-        if len(successful_responses) < 2 * self.consensus.faulty_nodes:
-            return {"status": "error", "message": "Not enough replicas responded to pre-prepare"}
+        # In a real system, the primary would now wait for 2f+1 prepare messages
+        # to arrive at its `handle_prepare` endpoint. This is a blocking simulation.
+        # This wait should ideally be non-blocking with callbacks or an event loop.
         
-        # For now, we'll assume the transaction is committed
-        # In a full implementation, we would wait for prepare and commit phases
-        return {
-            "status": "success",
-            "message": "Transaction accepted for processing",
-            "sequence": pre_prepare['sequence'],
-            "view": pre_prepare['view']
-        }
-    
+        # For simplification, we'll assume a delay and then check the accumulated messages.
+        print("[PBFT Primary] Simulating wait for prepare messages...")
+        time.sleep(settings.PBFT_PREPARE_TIMEOUT if hasattr(settings, 'PBFT_PREPARE_TIMEOUT') else 2) # Wait for replicas to respond
+
+        view = _pre_prepare_msg['view']
+        sequence = _pre_prepare_msg['sequence']
+        
+        # Check if enough prepare messages have been collected
+        # The messages are collected by the `handle_prepare` method when other nodes call it.
+        current_prepares = self.prepare_log.get((view, sequence), {})
+        
+        # Add primary's implicit prepare message to the count
+        num_prepares = len(current_prepares)
+        
+        required_prepares = 2 * self.consensus.faulty_nodes + 1 # includes primary's own
+        
+        print(f"[PBFT Primary] Collected {num_prepares} prepare messages for (view={view}, sequence={sequence}). Required: {required_prepares}")
+        
+        if num_prepares >= required_prepares:
+            print("[PBFT Primary] Enough prepare messages received. Broadcasting commit.")
+            commit_msg = self.consensus.commit(list(current_prepares.values())) # Pass list of prepare messages
+            if 'error' in commit_msg:
+                return {"status": "error", "message": f"Commit message creation failed: {commit_msg['error']}"}
+            
+            # Primary processes its own commit message
+            self.handle_commit(commit_msg)
+
+            # Broadcast commit message to replicas
+            self.broadcast(
+                '/api/consensus/commit/',
+                commit_msg,
+                exclude=[self.node_id]
+            )
+
+            # In a real system, primary waits for 2f+1 commit messages
+            print("[PBFT Primary] Simulating wait for commit messages...")
+            time.sleep(settings.PBFT_COMMIT_TIMEOUT if hasattr(settings, 'PBFT_COMMIT_TIMEOUT') else 2)
+
+            current_commits = self.commit_log.get((view, sequence), {})
+            num_commits = len(current_commits)
+            required_commits = 2 * self.consensus.faulty_nodes + 1
+
+            print(f"[PBFT Primary] Collected {num_commits} commit messages for (view={view}, sequence={sequence}). Required: {required_commits}")
+
+            if num_commits >= required_commits:
+                print(f"[PBFT Primary] Enough commit messages received. Executing block {block_index}.")
+                try:
+                    blockchain_state, _ = BlockchainState.objects.get_or_create(
+                        id=1,
+                        defaults={
+                            'last_block_number': 0,
+                            'total_transactions': 0,
+                            'active_nodes': len(self.nodes) + 1
+                        }
+                    )
+                    
+                    block = Block.objects.create(
+                        index=block_index,
+                        previous_hash=block_data['previous_hash'],
+                        data=block_data['data'],
+                        timestamp=block_data['timestamp'],
+                        nonce=0,
+                        hash='0' * 64
+                    )
+                    block.mine_block(difficulty=4)
+                    block.save()
+                    
+                    blockchain_state.update_state(
+                        block=block,
+                        transaction_count=len(self.pending_transactions)
+                    )
+                    
+                    print(f"[PBFT Primary] Committed block {block.index} with {len(self.pending_transactions)} transactions")
+                    self.pending_transactions = [] # Clear pending after successful commit
+                    self.consensus.set_state(PBFTState.REPLY) # Move to reply state
+                    
+                    return {
+                        "status": "success", 
+                        "message": "Block created and committed via PBFT consensus",
+                        "block_index": block.index,
+                        "transactions_processed": len(block_data['data']['transactions']) # Corrected count
+                    }
+                except Exception as e:
+                    print(f"[PBFT Primary] Error creating block: {str(e)}")
+                    return {"status": "error", "message": f"Block creation failed: {str(e)}"}
+            else:
+                self.consensus.set_state(PBFTState.REPLY) # Revert to reply state on failure
+                return {"status": "error", "message": f"Failed to reach commit consensus. Only {num_commits} commits received."}
+        else:
+            self.consensus.set_state(PBFTState.REPLY) # Revert to reply state on failure
+            return {"status": "error", "message": f"Failed to reach prepare consensus. Only {num_prepares} prepares received."}
+
+
+    # --- Consensus Message Handlers (for replicas, and primary processing its own/others' messages) ---
+
     def handle_pre_prepare(self, message: dict) -> dict:
         """
         Handle a pre-prepare message from the primary.
         
         Args:
-            message: Pre-prepare message
+            message: Pre-prepare message containing view, sequence, digest, and request
             
         Returns:
-            Dict containing the result of processing the message
+            Dict containing the result of processing the message with all required fields
         """
-        if self.consensus.is_primary():
-            return {"status": "error", "message": "Primary node cannot process pre-prepare messages"}
-        
-        # Verify the pre-prepare message
-        if not self.consensus._verify_pre_prepare(message):
-            return {"status": "error", "message": "Invalid pre-prepare message"}
-        
-        # Create a prepare message
-        prepare_msg = self.consensus.prepare(message)
-        if 'error' in prepare_msg:
-            return prepare_msg
-        
-        # Broadcast prepare message to all nodes
-        self.broadcast(
-            "consensus/prepare",
-            prepare_msg,
-            exclude=[self.node_id]
-        )
-        
-        return {"status": "success", "message": "Prepare message sent"}
-    
+        try:
+            # Replicas should process pre-prepare messages. Primary broadcasts them.
+            # If this method is called on the primary, it means the primary is
+            # processing its *own* message as if it were a replica to maintain consistency.
+            
+            view = message.get('view')
+            sequence = message.get('sequence')
+            digest = message.get('digest')
+            
+            # Basic validation of message content
+            if not all(k in message for k in ['view', 'sequence', 'digest', 'request']):
+                return {
+                    'status': 'error', 
+                    'message': 'Invalid pre-prepare message format (missing fields)',
+                    'node_id': self.node_id,
+                    'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                }
+
+            # Verify the pre-prepare message (e.g., digest, view number, sequence number)
+            # The _verify_pre_prepare method is assumed to be in PBFTConsensus
+            if not self.consensus._verify_pre_prepare(message):
+                return {
+                    'status': 'error', 
+                    'message': 'Pre-prepare message verification failed',
+                    'node_id': self.node_id,
+                    'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                }
+            
+            # Store the pre-prepare message
+            self.pre_prepare_log[(view, sequence)] = message
+            print(f"[Validator {self.node_id}] Received and verified pre-prepare for (view={view}, sequence={sequence})")
+
+            # Create a prepare message
+            # The `prepare` method in PBFTConsensus should internally check and update its state
+            prepare_msg = self.consensus.prepare(message)
+            if 'error' in prepare_msg:
+                prepare_msg.update({
+                    'node_id': self.node_id,
+                    'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                })
+                return prepare_msg
+            
+            # Add self's prepare message to log (important for reaching 2f+1 later)
+            self.prepare_log.setdefault((view, sequence), {})[self.node_id] = prepare_msg
+            print(f"[Validator {self.node_id}] Created and stored own prepare message for (view={view}, sequence={sequence})")
+
+            # Broadcast prepare message to all other replicas (including primary if it also listens to prepare)
+            # Usually, replicas send prepare to all, including the primary.
+            prepare_responses = self.broadcast(
+                '/api/consensus/prepare/',
+                prepare_msg,
+                exclude=[self.node_id] # Don't send to self again
+            )
+            
+            success_count = sum(1 for r in prepare_responses if r and r[1])
+            print(f"[Validator {self.node_id}] Broadcasted prepare message to {success_count}/{len(self.nodes)} nodes for (view={view}, sequence={sequence})")
+            
+            return {
+                'status': 'success',
+                'message': 'Prepare message processed and broadcasted',
+                'node_id': self.node_id,
+                'view': view,
+                'sequence': sequence,
+                'digest': digest,
+                'timestamp': time.time(),
+                'broadcast_results': {
+                    'total_nodes': len(self.nodes),
+                    'successful': success_count,
+                    'failed': len(self.nodes) - success_count
+                }
+            }
+            
+        except Exception as e:
+            print(f"[Validator {self.node_id}] Error in handle_pre_prepare: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Error processing pre-prepare: {str(e)}',
+                'node_id': self.node_id,
+                'view': message.get('view'),
+                'sequence': message.get('sequence'),
+                'digest': message.get('digest'),
+                'timestamp': time.time()
+            }
+
     def handle_prepare(self, message: dict) -> dict:
         """
         Handle a prepare message from a replica.
         
         Args:
-            message: Prepare message
+            message: Prepare message containing view, sequence, and digest
             
         Returns:
-            Dict containing the result of processing the message
+            Dict containing the result of processing the message with all required fields
         """
-        # In a full implementation, we would:
-        # 1. Verify the prepare message
-        # 2. Collect prepare messages until we have 2f + 1 matching ones
-        # 3. Create and broadcast a commit message
-        # 4. Wait for 2f + 1 commit messages
-        # 5. Execute the request and send a reply to the client
-        
-        # For now, we'll just log the prepare message
-        return {"status": "success", "message": "Prepare message received"}
-    
-    def check_health(self) -> dict:
+        try:
+            required_fields = ['view', 'sequence', 'digest', 'node_id']
+            if not all(field in message for field in required_fields):
+                return {
+                    'status': 'error',
+                    'message': 'Missing required fields in prepare message',
+                    'node_id': self.node_id,
+                    'view': message.get('view'),
+                    'sequence': message.get('sequence'),
+                    'digest': message.get('digest'),
+                    'timestamp': time.time()
+                }
+            
+            view = message['view']
+            sequence = message['sequence']
+            digest = message['digest']
+            sender_node_id = message['node_id']
+
+            print(f"[Validator {self.node_id}] Received prepare message from {sender_node_id} for (view={view}, sequence={sequence})")
+            
+            # Store the prepare message
+            self.prepare_log.setdefault((view, sequence), {})[sender_node_id] = message
+
+            # Check if we have 2f + 1 prepare messages for this (view, sequence, digest)
+            current_prepares = self.prepare_log.get((view, sequence), {})
+            num_prepares = len(current_prepares)
+            required_prepares = 2 * self.consensus.faulty_nodes + 1 # including own
+
+            print(f"[Validator {self.node_id}] Collected {num_prepares} prepare messages for (view={view}, sequence={sequence}). Required: {required_prepares}")
+
+            if num_prepares >= required_prepares and self.consensus.current_state != PBFTState.COMMIT:
+                # If this node has accumulated enough prepare messages and is not yet in COMMIT state
+                print(f"[Validator {self.node_id}] Enough prepare messages received. Moving to COMMIT phase.")
+                
+                # Create and broadcast commit message
+                commit_msg = self.consensus.commit(list(current_prepares.values())) # Pass collected prepare messages
+                if 'error' in commit_msg:
+                    commit_msg.update({
+                        'node_id': self.node_id, 'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                    })
+                    return commit_msg
+                
+                # Store own commit message
+                self.commit_log.setdefault((view, sequence), {})[self.node_id] = commit_msg
+                self.consensus.set_state(PBFTState.COMMIT) # Update node's state
+                
+                # Broadcast commit message to all nodes (excluding self)
+                commit_responses = self.broadcast(
+                    '/api/consensus/commit/',
+                    commit_msg,
+                    exclude=[self.node_id]
+                )
+                
+                success_count = sum(1 for r in commit_responses if r and r[1])
+                print(f"[Validator {self.node_id}] Broadcasted commit message to {success_count}/{len(self.nodes)} nodes for (view={view}, sequence={sequence})")
+                
+                return {
+                    'status': 'success',
+                    'message': 'Commit message created and broadcasted',
+                    'node_id': self.node_id,
+                    'view': view,
+                    'sequence': sequence,
+                    'digest': digest,
+                    'timestamp': time.time(),
+                    'broadcast_results': {
+                        'total_nodes': len(self.nodes),
+                        'successful': success_count,
+                        'failed': len(self.nodes) - success_count
+                    }
+                }
+            
+            # If not enough prepares, or if already committed, just acknowledge
+            return {
+                'status': 'success',
+                'message': 'Prepare message processed, awaiting more prepares or already committed.',
+                'node_id': self.node_id,
+                'view': view,
+                'sequence': sequence,
+                'digest': digest,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            print(f"[Validator {self.node_id}] Error in handle_prepare: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Error processing prepare: {str(e)}',
+                'node_id': self.node_id,
+                'view': message.get('view'),
+                'sequence': message.get('sequence'),
+                'digest': message.get('digest'),
+                'timestamp': time.time()
+            }
+
+    def handle_commit(self, message: dict) -> dict:
         """
-        Check the health of the validator and its connections.
+        Handle a commit message from a replica.
         
+        Args:
+            message: Commit message containing view, sequence, and digest
+            
         Returns:
-            Dict containing health information
+            Dict containing the result of processing the message with all required fields
         """
-        status = {
-            'node_id': self.node_id,
-            'address': self.node_address,
-            'port': self.port,
-            'is_primary': self.consensus.is_primary(),
-            'view': self.consensus.view,
-            'state': self.state.value,
-            'active_nodes': sum(1 for n in self.nodes.values() if n['active']),
-            'total_nodes': len(self.nodes) + 1,  # +1 for self
-            'pending_transactions': len(self.pending_transactions)
-        }
-        return status
+        try:
+            required_fields = ['view', 'sequence', 'digest', 'node_id']
+            if not all(field in message for field in required_fields):
+                return {
+                    'status': 'error',
+                    'message': 'Missing required fields in commit message',
+                    'node_id': self.node_id,
+                    'view': message.get('view'),
+                    'sequence': message.get('sequence'),
+                    'digest': message.get('digest'),
+                    'timestamp': time.time()
+                }
+
+            view = message['view']
+            sequence = message['sequence']
+            digest = message['digest']
+            sender_node_id = message['node_id']
+
+            print(f"[Validator {self.node_id}] Received commit message from {sender_node_id} for (view={view}, sequence={sequence})")
+
+            # Store the commit message
+            self.commit_log.setdefault((view, sequence), {})[sender_node_id] = message
+
+            # Check if we have 2f + 1 commit messages for this (view, sequence, digest)
+            current_commits = self.commit_log.get((view, sequence), {})
+            num_commits = len(current_commits)
+            required_commits = 2 * self.consensus.faulty_nodes + 1 # including own
+
+            print(f"[Validator {self.node_id}] Collected {num_commits} commit messages for (view={view}, sequence={sequence}). Required: {required_commits}")
+
+            if num_commits >= required_commits and self.consensus.current_state != PBFTState.REPLY:
+                # If this node has accumulated enough commit messages and hasn't replied yet
+                print(f"[Validator {self.node_id}] Enough commit messages received. Executing request and replying to client.")
+                
+                # Retrieve the original request data from the pre-prepare log
+                pre_prepare_data = self.pre_prepare_log.get((view, sequence))
+                if not pre_prepare_data or 'request' not in pre_prepare_data:
+                    print(f"[Validator {self.node_id}] Error: Original request data not found for (view={view}, sequence={sequence})")
+                    return {
+                        'status': 'error',
+                        'message': 'Original request data missing for execution',
+                        'node_id': self.node_id,
+                        'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                    }
+                
+                block_data = pre_prepare_data['request']
+                
+                try:
+                    # Get or create blockchain state
+                    blockchain_state, _ = BlockchainState.objects.get_or_create(
+                        id=1,
+                        defaults={
+                            'last_block_number': 0,
+                            'total_transactions': 0,
+                            'active_nodes': len(self.nodes) + 1
+                        }
+                    )
+                    
+                    block = Block.objects.create(
+                        index=block_data['index'],
+                        previous_hash=block_data['previous_hash'],
+                        data=block_data['data'],
+                        timestamp=block_data['timestamp'],
+                        nonce=0, # Temporarily
+                        hash='0' * 64 # Temporarily
+                    )
+                    block.mine_block(difficulty=4) # Mine to get actual hash and nonce
+                    block.save()
+                    
+                    blockchain_state.update_state(
+                        block=block,
+                        transaction_count=len(block_data['data']['transactions'])
+                    )
+                    
+                    print(f"[Validator {self.node_id}] Executed request and created block {block.index}.")
+                    self.consensus.set_state(PBFTState.REPLY) # Move to reply state
+
+                    return {
+                        'status': 'success',
+                        'message': 'Block committed and executed successfully',
+                        'node_id': self.node_id,
+                        'view': view,
+                        'sequence': sequence,
+                        'digest': digest,
+                        'block_index': block.index,
+                        'transactions_processed': len(block_data['data']['transactions']),
+                        'timestamp': time.time()
+                    }
+                except Exception as e:
+                    print(f"[Validator {self.node_id}] Error during block creation/execution: {str(e)}")
+                    return {
+                        'status': 'error',
+                        'message': f'Block creation/execution failed: {str(e)}',
+                        'node_id': self.node_id,
+                        'view': view, 'sequence': sequence, 'digest': digest, 'timestamp': time.time()
+                    }
+            
+            # If not enough commits, or already replied, just acknowledge
+            return {
+                'status': 'success',
+                'message': 'Commit message processed, awaiting more commits or already executed.',
+                'node_id': self.node_id,
+                'view': view,
+                'sequence': sequence,
+                'digest': digest,
+                'timestamp': time.time()
+            }
+
+        except Exception as e:
+            print(f"[Validator {self.node_id}] Error in handle_commit: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Error processing commit: {str(e)}',
+                'node_id': self.node_id,
+                'view': message.get('view'),
+                'sequence': message.get('sequence'),
+                'digest': message.get('digest'),
+                'timestamp': time.time()
+            }

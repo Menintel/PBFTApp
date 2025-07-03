@@ -36,6 +36,19 @@ class PBFTConsensus:
         self.log = []  # Log of all messages
         self.prepare_messages = {}  # Store prepare messages
         self.commit_messages = {}   # Store commit messages
+        self.current_state = PBFTState.REPLY  # Initialize current state to REPLY
+        
+    def set_state(self, state: PBFTState) -> None:
+        """
+        Set the current state of the PBFT node.
+        
+        Args:
+            state: The new state to set (from PBFTState enum)
+        """
+        if not isinstance(state, PBFTState):
+            raise ValueError(f"State must be a PBFTState enum value, got {type(state)}")
+        self.current_state = state
+        print(f"[Consensus] Node {self.node_id} state changed to {state.value}")
         
     def get_primary(self, view: int) -> str:
         """
@@ -184,6 +197,23 @@ class PBFTConsensus:
         self.log.append(('reply', reply_msg))
         return reply_msg
     
+    def _hash_message(self, message: Any) -> str:
+        """Generate a SHA-256 hash of the message.
+        
+        Args:
+            message: The message to hash (can be any JSON-serializable object)
+            
+        Returns:
+            str: Hexadecimal digest of the message
+        """
+        if isinstance(message, (str, int, float, bool, type(None))):
+            message_str = str(message)
+        else:
+            # Convert dictionaries and other objects to a stable JSON string
+            message_str = json.dumps(message, sort_keys=True)
+            
+        return hashlib.sha256(message_str.encode('utf-8')).hexdigest()
+        
     def _verify_pre_prepare(self, message: Dict[str, Any]) -> bool:
         """Verify a pre-prepare message."""
         required_fields = {'view', 'sequence', 'digest', 'request'}
