@@ -1,6 +1,7 @@
 import json
 import requests
 import time
+import threading
 from typing import Dict, List, Optional, Tuple
 from django.conf import settings
 from image_app.models import Block, BlockchainState
@@ -90,7 +91,43 @@ class PBFTValidator:
 
         print(f"[Validator] Initialized node {self.node_id} at {self.node_url}")
         print(f"[Validator] Known nodes: {list(self.nodes.keys())}")
+        
+        # Start health check thread
+        self.health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self.health_check_thread.start()
     
+    def _health_check_loop(self):
+        """Background thread to periodically check node health and recover inactive nodes."""
+        while True:
+            time.sleep(10)  # Check every 10 seconds
+            self._check_inactive_nodes()
+
+    def _check_inactive_nodes(self):
+        """Check inactive nodes to see if they've recovered."""
+        current_time = time.time()
+        for node_id, node_info in list(self.nodes.items()):
+            # Skip active nodes or nodes that were recently checked
+            if node_info.get('active', True) or \
+               current_time - node_info.get('last_attempt', 0) < 10:
+                continue
+                
+            print(f"[Health Check] Attempting to recover node {node_id}")
+            try:
+                # Try to reach the node's health endpoint
+                health_url = f"{node_info['url'].rstrip('/')}/health/"
+                response = requests.get(health_url, timeout=5)
+                if response.status_code == 200:
+                    # Node is back online
+                    node_info['active'] = True
+                    node_info['failures'] = 0
+                    node_info['last_seen'] = time.time()
+                    print(f"[Health Check] Node {node_id} is back online")
+            except Exception as e:
+                # Node is still down, will retry later
+                print(f"[Health Check] Node {node_id} still unreachable: {str(e)}")
+            finally:
+                node_info['last_attempt'] = current_time
+
     def broadcast(self, endpoint: str, message: dict, exclude: List[str] = None) -> List[Tuple[str, bool, dict]]:
         """
         Broadcast a message to all nodes in the network with enhanced error handling and logging.
@@ -160,19 +197,28 @@ class PBFTValidator:
             except requests.exceptions.Timeout:
                 error_msg = f"Request to {node_id} timed out after 10 seconds"
                 print(f"[Broadcast] {error_msg}")
-                node_info['active'] = False
+                node_info['failures'] = node_info.get('failures', 0) + 1
+                if node_info['failures'] >= self.max_failures:
+                    node_info['active'] = False
+                    print(f"[Broadcast] Marking {node_id} as inactive after {self.max_failures} failures")
                 return (node_id, False, {'error': error_msg})
                 
             except requests.exceptions.ConnectionError as e:
                 error_msg = f"Connection error to {node_id} at {url}: {str(e)}"
                 print(f"[Broadcast] {error_msg}")
-                node_info['active'] = False
+                node_info['failures'] = node_info.get('failures', 0) + 1
+                if node_info['failures'] >= self.max_failures:
+                    node_info['active'] = False
+                    print(f"[Broadcast] Marking {node_id} as inactive after {self.max_failures} failures")
                 return (node_id, False, {'error': error_msg})
                 
             except requests.exceptions.RequestException as e:
                 error_msg = f"Request error to {node_id} at {url}: {str(e)}"
                 print(f"[Broadcast] {error_msg}")
-                node_info['active'] = False
+                node_info['failures'] = node_info.get('failures', 0) + 1
+                if node_info['failures'] >= self.max_failures:
+                    node_info['active'] = False
+                    print(f"[Broadcast] Marking {node_id} as inactive after {self.max_failures} failures")
                 return (node_id, False, {'error': error_msg})
                 
             except Exception as e:

@@ -1,0 +1,116 @@
+{% extends 'image_app/base.html' %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <h2 class="mb-4">Blockchain Ledger</h2>
+            
+            <!-- Blockchain Summary -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">Blockchain Summary</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="card bg-light mb-3">
+                                <div class="card-body">
+                                    <h6 class="card-title">Total Blocks</h6>
+                                    <p class="h3">{{ total_blocks }}</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card bg-light mb-3">
+                                <div class="card-body">
+                                    <h6 class="card-title">Total Transactions</h6>
+                                    <p class="h3">{{ blockchain_state.total_transactions }}</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card bg-light mb-3">
+                                <div class="card-body">
+                                    <h6 class="card-title">Active Nodes</h6>
+                                    <p class="h3">{{ blockchain_state.active_nodes }}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Blocks List -->
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">Blocks</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>Block #</th>
+                                    <th>Timestamp</th>
+                                    <th>Hash</th>
+                                    <th>Transactions</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for entry in ledger_entries %}
+                                <tr>
+                                    <td>
+                                        <a href="#block-{{ entry.block_index }}" data-bs-toggle="collapse">
+                                            {{ entry.block_index }}
+                                        </a>
+                                    </td>
+                                    <td>{{ entry.timestamp|date:"Y-m-d H:i:s" }}</td>
+                                    <td class="text-truncate" style="max-width: 150px;" title="{{ entry.block_hash }}">
+                                        {{ entry.block_hash|slice:":15" }}...{{ entry.block_hash|slice:"-10:" }}
+                                    </td>
+                                    <td>
+                                        {{ entry.block.transactions.count }}
+                                    </td>
+                                    <td>
+                                        {% if entry.is_valid %}
+                                            <span class="badge bg-success">Valid</span>
+                                        {% else %}
+                                            <span class="badge bg-danger">Invalid</span>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                <tr id="block-{{ entry.block_index }}" class="collapse">
+                                    <td colspan="5">
+                                        <div class="p-3 bg-light">
+                                            <h6>Block Details</h6>
+                                            <pre class="bg-white p-2 rounded" style="max-height: 200px; overflow-y: auto;">
+{{ entry.block.data|pprint }}
+                                            </pre>
+                                            <div class="mt-2">
+                                                <strong>Previous Hash:</strong> 
+                                                <span class="font-monospace">{{ entry.block.previous_hash }}</span>
+                                            </div>
+                                            <div class="mt-1">
+                                                <strong>Nonce:</strong> {{ entry.block.nonce }}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% empty %}
+                                <tr>
+                                    <td colspan="5" class="text-center py-4">
+                                        <p class="text-muted">No blocks in the ledger yet.</p>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

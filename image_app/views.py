@@ -10,7 +10,7 @@ from django.http import JsonResponse, HttpRequest
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from pbft.validator import PBFTValidator
-from .models import Transaction, Block, Validator, BlockchainState
+from .models import Transaction, Block, Validator, BlockchainState, Ledger
 
 class UnsplashGalleryView(View):
     def __init__(self, **kwargs):
@@ -32,10 +32,82 @@ class UnsplashGalleryView(View):
             {'id': 'node_4', 'address': '127.0.0.1', 'port': 8003},
         ]
         
-        # Filter out current node
-        nodes = [n for n in nodes if n['id'] != node_id]
+        # Create a new validator instance
+        return PBFTValidator(
+            node_id=node_id,
+            node_address=node_address,
+            port=node_port,
+            node_list=nodes
+        )
+    
+    def get(self, request):
+        """Handle GET requests to the gallery view."""
+        # Redirect to the ledger view for now
+        return redirect('image_app:ledger-view')
+
+
+class LedgerView(View):
+    """View to display the blockchain ledger"""
+    template_name = 'image_app/ledger.html'
+    
+    def get(self, request):
+        """Display the ledger with all blocks"""
+        try:
+            # Get all ledger entries ordered by block index
+            ledger_entries = Ledger.objects.select_related('block').order_by('-block_index')
+            
+            # Get blockchain state for summary
+            blockchain_state = BlockchainState.get_instance()
+            
+            # Get node information from environment variables
+            node_id = os.getenv('NODE_ID', 'node_1')
+            is_primary = node_id == 'node_1'  # Simple logic for demo
+            
+            context = {
+                'ledger_entries': ledger_entries,
+                'blockchain_state': blockchain_state,
+                'total_blocks': ledger_entries.count(),
+                'node_id': node_id,
+                'is_primary': is_primary,
+                'current_view': 0,  # Default view
+            }
+            return render(request, self.template_name, context)
+            
+        except Exception as e:
+            # Log the error and show a user-friendly message
+            print(f"Error in LedgerView: {str(e)}")
+            return render(request, 'image_app/error.html', {
+                'error_message': 'An error occurred while loading the ledger.',
+                'error_details': str(e)
+            }, status=500)
+
+class UnsplashGalleryView(View):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.validator = self._get_validator()
+    
+    def _get_validator(self) -> PBFTValidator:
+        """Initialize or get the PBFT validator instance."""
+        # In a real implementation, this would be a singleton or managed by Django's app config
+        node_id = os.getenv('NODE_ID', 'node_1')
+        node_address = os.getenv('NODE_ADDRESS', '127.0.0.1')
+        node_port = int(os.getenv('NODE_PORT', 8000))
         
-        return PBFTValidator(node_id, node_address, node_port, nodes)
+        # Get list of known nodes (in a real app, this would be from a config or database)
+        nodes = [
+            {'id': 'node_1', 'address': '127.0.0.1', 'port': 8000},
+            {'id': 'node_2', 'address': '127.0.0.1', 'port': 8001},
+            {'id': 'node_3', 'address': '127.0.0.1', 'port': 8002},
+            {'id': 'node_4', 'address': '127.0.0.1', 'port': 8003},
+        ]
+        
+        # Create a new validator instance
+        return PBFTValidator(
+            node_id=node_id,
+            node_address=node_address,
+            port=node_port,
+            node_list=nodes
+        )
     
     def get(self, request):
         # Get the Unsplash API key from environment variables

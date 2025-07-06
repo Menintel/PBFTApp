@@ -78,6 +78,82 @@ class Validator(models.Model):
         return f'http://{self.address}:{self.port}'
 
 
+class Ledger(models.Model):
+    """Central ledger that tracks all blocks in the blockchain"""
+    block = models.OneToOneField(Block, on_delete=models.CASCADE, related_name='ledger_entry')
+    block_index = models.PositiveIntegerField(db_index=True)
+    block_hash = models.CharField(max_length=64, db_index=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    is_valid = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['block_index']
+        indexes = [
+            models.Index(fields=['block_index', 'block_hash']),
+        ]
+    
+    def __str__(self):
+        return f"Ledger Entry - Block {self.block_index} ({'Valid' if self.is_valid else 'Invalid'})"
+    
+    @classmethod
+    def add_block(cls, block):
+        """Add a new block to the ledger"""
+        return cls.objects.create(
+            block=block,
+            block_index=block.index,
+            block_hash=block.hash,
+            is_valid=True
+        )
+    
+    @classmethod
+    def get_block_by_hash(cls, block_hash):
+        """Retrieve a block by its hash"""
+        try:
+            return cls.objects.get(block_hash=block_hash, is_valid=True).block
+        except cls.DoesNotExist:
+            return None
+    
+    @classmethod
+    def get_block_by_index(cls, index):
+        """Retrieve a block by its index"""
+        try:
+            return cls.objects.get(block_index=index, is_valid=True).block
+        except cls.DoesNotExist:
+            return None
+    
+    @classmethod
+    def get_latest_block(cls):
+        """Get the most recent block in the ledger"""
+        try:
+            return cls.objects.filter(is_valid=True).latest('block_index').block
+        except cls.DoesNotExist:
+            return None
+    
+    @classmethod
+    def get_chain_length(cls):
+        """Get the current length of the blockchain"""
+        return cls.objects.filter(is_valid=True).count()
+    
+    @classmethod
+    def validate_chain(cls):
+        """Validate the entire blockchain"""
+        blocks = cls.objects.filter(is_valid=True).order_by('block_index')
+        previous_hash = '0'
+        
+        for entry in blocks:
+            block = entry.block
+            if block.previous_hash != previous_hash:
+                entry.is_valid = False
+                entry.save()
+                return False
+            if block.hash != block.calculate_hash():
+                entry.is_valid = False
+                entry.save()
+                return False
+            previous_hash = block.hash
+        return True
+
+
 class BlockchainState(models.Model):
     """Stores the current state of the blockchain"""
     last_block = models.OneToOneField(Block, on_delete=models.CASCADE, related_name='chain_state', null=True, blank=True)
@@ -85,6 +161,7 @@ class BlockchainState(models.Model):
     active_nodes = models.PositiveIntegerField(default=1)
     last_block_number = models.PositiveIntegerField(default=0)
     total_transactions = models.PositiveIntegerField(default=0)
+    ledger_head = models.OneToOneField(Ledger, on_delete=models.SET_NULL, null=True, blank=True, related_name='head_of_chain')
     
     @classmethod
     def get_instance(cls):
@@ -92,13 +169,25 @@ class BlockchainState(models.Model):
         instance, created = cls.objects.get_or_create(pk=1)
         return instance
     
-    def update_state(self, block=None, transaction_count=0):
+    @classmethod
+    def update_state(cls, block=None, transaction_count=0):
         """Update the blockchain state"""
+        state = cls.get_instance()
         if block:
-            self.last_block = block
-            self.last_block_number = block.index
-        self.total_transactions += transaction_count
-        self.save()
+            state.last_block = block
+            state.last_block_number = block.index
+            
+            # Add block to ledger and update head
+            try:
+                ledger_entry = Ledger.add_block(block)
+                state.ledger_head = ledger_entry
+            except Exception as e:
+                print(f"Error updating ledger: {str(e)}")
+                raise
+                
+        state.total_transactions += transaction_count
+        state.save()
+        return state
     
     def __str__(self):
         if self.last_block:

@@ -2,6 +2,7 @@ from django.urls import path
 from . import views
 from . import consensus_views
 from .consensus_views import HealthCheckView
+from .views import LedgerView
 
 app_name = 'image_app'
 
@@ -18,6 +19,9 @@ urlpatterns = [
     path('api/consensus/commit/', 
          consensus_views.CommitView.as_view(), 
          name='commit'),
+         
+    # Ledger View
+    path('ledger/', LedgerView.as_view(), name='ledger-view'),
     
     # Transaction endpoint
     path('api/transaction/', 
